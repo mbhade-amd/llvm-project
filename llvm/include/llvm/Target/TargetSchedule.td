@@ -81,6 +81,9 @@ class SchedMachineModel {
   int LoadLatency = -1; // Cycles for loads to access the cache.
   int HighLatency = -1; // Approximation of cycles for "high latency" ops.
   int MispredictPenalty = -1; // Extra cycles for a mispredicted branch.
+  // Extra cycles a load stalls when store-to-load forwarding fails. 0 (the
+  // default) means the target does not model this hazard.
+  int StoreLoadForwardingPenalty = -1;
 
   // Per-cycle resources tables.
   ProcessorItineraries Itineraries = NoItineraries;

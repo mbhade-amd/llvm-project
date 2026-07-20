@@ -317,6 +317,15 @@ struct MCSchedModel {
   unsigned MispredictPenalty;
   static const unsigned DefaultMispredictPenalty = 10;
 
+  // StoreLoadForwardingPenalty is the typical number of extra cycles a load
+  // stalls when hardware store-to-load forwarding fails (the load's bytes are
+  // not fully contained in a single, recent store, so it must wait for the
+  // store to drain to cache). A value of 0 means the target does not model
+  // this hazard. Consumed by the SLP vectorizer when a widened store would
+  // break forwarding for a nearby loop-carried load.
+  unsigned StoreLoadForwardingPenalty;
+  static const unsigned DefaultStoreLoadForwardingPenalty = 0;
+
   bool PostRAScheduler; // default value is false
 
   bool CompleteModel;

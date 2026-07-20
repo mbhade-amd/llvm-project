@@ -175,19 +175,10 @@ private:
                                           unsigned Idx, unsigned MinVF,
                                           unsigned &Size);
 
-  /// Returns true if vectorizing the store chain would cause store-to-load
-  /// forwarding conflicts due to short loop-carried dependence distances.
-  bool hasStoreLoadForwardingConflict(ArrayRef<Value *> Chain, unsigned VF);
-
   bool vectorizeStores(
       ArrayRef<StoreInst *> Stores, slpvectorizer::BoUpSLP &R,
       DenseSet<std::tuple<Value *, Value *, Value *, Value *, unsigned>>
           &Visited);
-
-  /// Cached STLF conflict decisions keyed by (first store in chain, VF).
-  /// Avoids re-walking the LAA dependence list when the same chain is retried
-  /// at multiple vector factors.
-  DenseMap<std::pair<const StoreInst *, unsigned>, bool> StlfConflictCache;
 
   /// The store instructions in a basic block organized by base pointer.
   StoreListMap Stores;

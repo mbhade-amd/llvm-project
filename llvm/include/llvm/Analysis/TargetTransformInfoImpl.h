@@ -676,6 +676,11 @@ public:
   }
 
   virtual unsigned getCacheLineSize() const { return 0; }
+
+  virtual InstructionCost getStoreLoadForwardingConflictCost(
+      Type *VecTy, TargetTransformInfo::TargetCostKind CostKind) const {
+    return 0;
+  }
   virtual std::optional<unsigned>
   getCacheSize(TargetTransformInfo::CacheLevel Level) const {
     switch (Level) {

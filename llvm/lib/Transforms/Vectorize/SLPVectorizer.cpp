@@ -274,7 +274,8 @@ static cl::opt<bool> PerLaneGatherScale(
 
 static cl::opt<bool> EnableSLPStoreLoadForwardCheck(
     "slp-store-load-forward-check", cl::init(true), cl::Hidden,
-    cl::desc("Check for store-to-load forwarding conflicts in SLP"));
+    cl::desc("Add a cost penalty to store chains whose vectorization would "
+             "break store-to-load forwarding in SLP"));
 
 // Limit the number of alias checks. The limit is chosen so that
 // it has no negative effect on the llvm benchmarks.
@@ -2136,9 +2137,10 @@ public:
   BoUpSLP(Function *Func, ScalarEvolution *Se, TargetTransformInfo *Tti,
           TargetLibraryInfo *TLi, AAResults *Aa, LoopInfo *Li,
           DominatorTree *Dt, AssumptionCache *AC, DemandedBits *DB,
-          const DataLayout *DL, OptimizationRemarkEmitter *ORE)
+          const DataLayout *DL, OptimizationRemarkEmitter *ORE,
+          LoopAccessInfoManager *LAIs = nullptr)
       : BatchAA(*Aa), F(Func), SE(Se), TTI(Tti), TLI(TLi), LI(Li), DT(Dt),
-        AC(AC), DB(DB), DL(DL), ORE(ORE),
+        AC(AC), DB(DB), DL(DL), ORE(ORE), LAIs(LAIs),
         Builder(Se->getContext(), TargetFolder(*DL)) {
     CodeMetrics::collectEphemeralValues(F, AC, EphValues);
     // Use the vector register size specified by the target unless overridden
@@ -2176,6 +2178,13 @@ public:
   /// \returns the cost incurred by unwanted spills and fills, caused by
   /// holding live values over call sites.
   InstructionCost getSpillCost();
+
+  /// \returns true if widening the store chain anchored at \p BaseStore into a
+  /// vector store of \p VF elements would break store-to-load forwarding for a
+  /// nearby loop-carried load (a short, misaligned backward dependence). Used
+  /// to add an STLF penalty to the store entry's cost. Result is memoized in
+  /// StlfConflictCache.
+  bool findStoreLoadForwardingConflict(StoreInst *BaseStore, unsigned VF);
 
   /// Calculates the cost of the subtrees, trims non-profitable ones and returns
   /// final cost.
@@ -2315,6 +2324,9 @@ public:
     TreeEntryToStridedPtrInfoMap.clear();
     CurrentLoopNest.clear();
     MergedLoopBTCs.clear();
+    // Loads/stores may be reconstructed on the next vectorization attempt, so
+    // stale STLF decisions must not carry over.
+    StlfConflictCache.clear();
   }
 
   unsigned getTreeSize() const { return VectorizableTree.size(); }
@@ -6456,6 +6468,14 @@ private:
   DemandedBits *DB;
   const DataLayout *DL;
   OptimizationRemarkEmitter *ORE;
+  /// Cached per-loop memory dependence info, used to detect store-to-load
+  /// forwarding hazards during store-chain costing. May be null.
+  LoopAccessInfoManager *LAIs = nullptr;
+
+  /// Cached STLF conflict decisions keyed by (base store of chain, VF), to
+  /// avoid re-walking the LAA dependence list when the store entry is costed
+  /// repeatedly. Cleared on each buildTree() via deleteTree().
+  SmallDenseMap<std::pair<const StoreInst *, unsigned>, bool> StlfConflictCache;
 
   unsigned MaxVecRegSize; // This is set by TTI or overridden by cl::opt.
   unsigned MinVecRegSize; // Set by cl::opt (default: 128).
@@ -17742,6 +17762,13 @@ BoUpSLP::getEntryCost(const TreeEntry *E, ArrayRef<Value *> VectorizedVals,
               BaseSI->getPointerAddressSpace(), CostKind, OpInfo);
         }
       }
+      // Widening this store chain can break store-to-load forwarding for a
+      // nearby loop-carried load. Rather than reject the tree outright, add
+      // the target's modeled STLF penalty so a chain that is still profitable
+      // after paying it can vectorize.
+      if (EnableSLPStoreLoadForwardCheck &&
+          findStoreLoadForwardingConflict(BaseSI, E->getVectorFactor()))
+        VecStCost += TTI->getStoreLoadForwardingConflictCost(VecTy, CostKind);
       return VecStCost + CommonCost;
     };
     SmallVector<Value *> PointerOps(VL.size());
@@ -27329,7 +27356,6 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
 
   Stores.clear();
   GEPs.clear();
-  StlfConflictCache.clear();
   bool Changed = false;
 
   // If the target claims to have no vector registers don't attempt
@@ -27348,7 +27374,7 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
 
   // Use the bottom up slp vectorizer to construct chains that start with
   // store instructions.
-  BoUpSLP R(&F, SE, TTI, TLI, AA, LI, DT, AC, DB, DL, ORE_);
+  BoUpSLP R(&F, SE, TTI, TLI, AA, LI, DT, AC, DB, DL, ORE_, LAIs);
 
   // A general note: the vectorizer must use BoUpSLP::eraseInstruction() to
   // delete instructions.
@@ -27392,12 +27418,12 @@ bool SLPVectorizerPass::runImpl(Function &F, ScalarEvolution *SE_,
   return Changed;
 }
 
-bool SLPVectorizerPass::hasStoreLoadForwardingConflict(ArrayRef<Value *> Chain,
-                                                       unsigned VF) {
-  if (Chain.empty() || !LAIs)
+bool BoUpSLP::findStoreLoadForwardingConflict(StoreInst *BaseStore,
+                                              unsigned VF) {
+  if (!BaseStore || !LAIs)
     return false;
 
-  auto *FirstStore = cast<StoreInst>(Chain[0]);
+  StoreInst *FirstStore = BaseStore;
 
   // Cache lookup: avoid re-walking the LAA dependence list when the same
   // chain is retried at multiple vector factors.
@@ -27552,21 +27578,6 @@ SLPVectorizerPass::vectorizeStoreChain(ArrayRef<Value *> Chain, BoUpSLP &R,
     // isAllowedNonPowerOf2VF for supported widths.
     if (!VectorizeNonPowerOf2 || (VF < MinVF && VF + 1 != MinVF))
       return false;
-  }
-
-  // Early bail-out: reject chains that would suffer STLF stalls before doing
-  // expensive tree analysis (buildTree, reorder, getTreeCost, etc.).
-  if (EnableSLPStoreLoadForwardCheck &&
-      hasStoreLoadForwardingConflict(Chain, VF)) {
-    LLVM_DEBUG(dbgs() << "SLP: Skipping store chain due to potential "
-                         "store-to-load forwarding conflict\n");
-    using namespace ore;
-    R.getORE()->emit(
-        OptimizationRemarkMissed(SV_NAME, "StoreLoadForwardConflict",
-                                 cast<StoreInst>(Chain[0]))
-        << "Stores not SLP vectorized: short loop-carried dependence "
-           "distance could cause store-to-load forwarding stalls");
-    return false;
   }
 
   LLVM_DEBUG(dbgs() << "SLP: Analyzing " << VF << " stores at offset " << Idx

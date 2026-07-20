@@ -23,8 +23,9 @@ target triple = "x86_64-unknown-linux-gnu"
 ; store at A[i].  The load at A[i-5] is 20 bytes behind:
 ;   20 % 16 = 4  -> misaligned, load straddles two pending vector stores
 ;   20 / 16 = 1  -> store still hot in store buffer
-; The check bails out at VF=4. Sub-chains at VF=2 are checked per-base:
-; {A[i+1],A[i+2]} has distance 24, 24%8=0 → safe, so it still vectorizes.
+; The STLF penalty makes the VF=4 store entry unprofitable. Sub-chains at
+; VF=2 are priced per-base: {A[i+1],A[i+2]} has distance 24, 24%8=0 → no
+; conflict, no penalty, so it still vectorizes.
 ;
 define void @stlf_conflict_backward_misaligned(ptr noalias %A, i64 %n) {
 ; STLF-ON-LABEL: define void @stlf_conflict_backward_misaligned(
@@ -418,7 +419,8 @@ for.end:
 ;
 ; Both A[i-5] (distance 20 bytes) and A[i-7] (distance 28 bytes) are
 ; misaligned to a 16-byte vector store and within the safety window.  The
-; check fires on the first one encountered and bails out.
+; check fires on the first one encountered and the store entry is penalized,
+; keeping the chain scalar.
 ;
 define void @stlf_multiple_conflicting_loads(ptr noalias %A, i64 %n) {
 ; STLF-ON-LABEL: define void @stlf_multiple_conflicting_loads(
@@ -593,10 +595,10 @@ for.end:
 ; Test 9: Motivating example — a[i] = a[i-1] + 1.
 ;
 ; Distance = 4 bytes (1 element) from chain base. VectorStoreBytes = 16
-; at VF=4. 4 % 16 = 4 → misaligned → STLF conflict. The full 4-wide
-; chain is rejected. Sub-chains that are individually misaligned are also
-; rejected; only sub-chains where the distance happens to be aligned to
-; the narrower vector store width survive.
+; at VF=4. 4 % 16 = 4 → misaligned → STLF conflict. The full 4-wide store
+; entry is penalized and is not profitable. Sub-chains that are individually
+; misaligned are penalized too; only sub-chains where the distance happens to
+; be aligned to the narrower vector store width vectorize.
 ;
 define void @stlf_conflict_short_backward(ptr noalias %A, i64 %n) {
 ; STLF-ON-LABEL: define void @stlf_conflict_short_backward(
