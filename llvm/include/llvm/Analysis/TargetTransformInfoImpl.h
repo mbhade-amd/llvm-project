@@ -23,6 +23,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/MC/MCSchedule.h"
 #include <optional>
 #include <utility>
 
@@ -679,7 +680,10 @@ public:
 
   virtual InstructionCost getStoreLoadForwardingConflictCost(
       Type *VecTy, TargetTransformInfo::TargetCostKind CostKind) const {
-    return 0;
+    // No subtarget scheduling model is available here, so fall back to the
+    // conservative default STLF stall penalty (targets with a real model go
+    // through BasicTTIImpl and use their own value instead).
+    return InstructionCost(MCSchedModel::DefaultStoreLoadForwardingPenalty);
   }
   virtual std::optional<unsigned>
   getCacheSize(TargetTransformInfo::CacheLevel Level) const {

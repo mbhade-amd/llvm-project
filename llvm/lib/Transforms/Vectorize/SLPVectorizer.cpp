@@ -27457,21 +27457,16 @@ bool BoUpSLP::findStoreLoadForwardingConflict(StoreInst *BaseStore,
   // object as the store chain, STLF conflicts are impossible. This avoids
   // paying for LAA on loops that obviously cannot conflict.
   Value *StoreBase = getUnderlyingObject(FirstStore->getPointerOperand());
-  bool HasSameBaseLoad = false;
-  for (BasicBlock *BB : L->blocks()) {
-    for (Instruction &I : *BB) {
-      if (auto *LdI = dyn_cast<LoadInst>(&I)) {
-        if (LdI->isSimple() &&
-            getUnderlyingObject(LdI->getPointerOperand()) == StoreBase) {
-          HasSameBaseLoad = true;
-          break;
-        }
-      }
-    }
-    if (HasSameBaseLoad)
-      break;
-  }
-  if (!HasSameBaseLoad)
+  auto HasSameBaseLoad = [&]() {
+    for (BasicBlock *BB : L->blocks())
+      for (Instruction &I : *BB)
+        if (auto *LdI = dyn_cast<LoadInst>(&I))
+          if (LdI->isSimple() &&
+              getUnderlyingObject(LdI->getPointerOperand()) == StoreBase)
+            return true;
+    return false;
+  };
+  if (!HasSameBaseLoad())
     return CacheAndReturn(false);
 
   const LoopAccessInfo &LAI = LAIs->getInfo(*L);
