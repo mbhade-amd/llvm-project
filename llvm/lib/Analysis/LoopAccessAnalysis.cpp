@@ -30,6 +30,7 @@
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopIterator.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -80,12 +81,11 @@ static cl::opt<ElementCount, true>
                         cl::location(VectorizerParams::VectorizationFactor));
 ElementCount VectorizerParams::VectorizationFactor;
 
-static cl::opt<unsigned, true>
-VectorizationInterleave("force-vector-interleave", cl::Hidden,
-                        cl::desc("Sets the vectorization interleave count. "
-                                 "Zero is autoselect."),
-                        cl::location(
-                            VectorizerParams::VectorizationInterleave));
+static cl::opt<unsigned, true> VectorizationInterleave(
+    "force-vector-interleave", cl::Hidden,
+    cl::desc("Sets the vectorization interleave count. "
+             "Zero is autoselect."),
+    cl::location(VectorizerParams::VectorizationInterleave));
 unsigned VectorizerParams::VectorizationInterleave;
 
 static cl::opt<unsigned, true> RuntimeMemoryCheckThreshold(
@@ -168,6 +168,16 @@ static cl::opt<unsigned> MaxForkedSCEVDepth(
     "max-forked-scev-depth", cl::Hidden,
     cl::desc("Maximum recursion depth when finding forked SCEVs (default = 5)"),
     cl::init(5));
+
+// The default covers a table indexed by a 16-bit value with elements of up to
+// 16 bytes. Wider intervals, e.g. from a full 32-bit index, are expected to
+// overlap other objects and make the runtime check fail.
+static cl::opt<uint64_t> MaxRangeBoundBytes(
+    "laa-max-range-bound-bytes", cl::Hidden,
+    cl::desc("Maximum size in bytes of a runtime-check interval derived only "
+             "from the value range of a non-affine pointer offset "
+             "(default = 1048576)"),
+    cl::init(1 << 20));
 
 static cl::opt<bool> SpeculateUnitStride(
     "laa-speculate-unit-stride", cl::Hidden,
@@ -435,23 +445,301 @@ getNonAffineMonotonicBounds(const Loop *Lp, const SCEV *PtrExpr,
           SE->getAddExpr(Base, OffEnd, EltSizeSCEV)};
 }
 
+/// Split \p Offset, the offset of a non-wrapping pointer add from its base,
+/// into the sum of its non-constant loop-invariant terms and the sum of the
+/// remaining terms. A constant multiplier of an add is distributed first if
+/// neither wraps, so C * (A + B) splits like C * A + C * B. Every term is then
+/// at most \p Offset as an unsigned value. Returns {nullptr, Offset} if there
+/// is nothing to split off.
+static std::pair<const SCEV *, const SCEV *>
+splitLoopInvariantOffset(const SCEV *Offset, const Loop *Lp,
+                         ScalarEvolution &SE) {
+  const SCEV *Sum = Offset;
+  if (const auto *Mul = dyn_cast<SCEVMulExpr>(Offset);
+      Mul && Mul->getNumOperands() == 2 && Mul->hasNoUnsignedWrap() &&
+      isa<SCEVConstant>(Mul->getOperand(0)))
+    if (const auto *Add = dyn_cast<SCEVAddExpr>(Mul->getOperand(1));
+        Add && Add->hasNoUnsignedWrap()) {
+      SmallVector<SCEVUse> Terms;
+      for (const SCEV *Op : Add->operands())
+        Terms.push_back(SE.getMulExpr(Mul->getOperand(0), Op));
+      Sum = SE.getAddExpr(Terms);
+    }
+
+  const auto *Add = dyn_cast<SCEVAddExpr>(Sum);
+  if (!Add)
+    return {nullptr, Offset};
+  SmallVector<SCEVUse> Invariant, Variant;
+  for (const SCEV *Op : Add->operands())
+    (!isa<SCEVConstant>(Op) && SE.isLoopInvariant(Op, Lp) ? Invariant : Variant)
+        .push_back(Op);
+  if (Invariant.empty() || Variant.empty())
+    return {nullptr, Offset};
+  return {SE.getAddExpr(Invariant), SE.getAddExpr(Variant)};
+}
+
+/// Return the half-open interval [Lo, Hi) of byte offsets covered by an access
+/// of \p EltSize bytes at any value of \p Offset, from the unsigned range of
+/// \p Offset, in which case Lo and Hi are non-negative as signed values. If
+/// \p AllowSigned is set and the unsigned range does not fit, use the signed
+/// range instead. The range of loop-invariant terms is narrowed by the loop
+/// guards \p Guards, if given.
+static std::optional<std::pair<APInt, APInt>>
+getOffsetRangeInterval(const SCEV *Offset, const APInt &EltSize,
+                       ScalarEvolution &SE, ScalarEvolution::LoopGuards *Guards,
+                       bool AllowSigned = false) {
+  if (Guards)
+    Offset = SE.applyLoopGuards(Offset, *Guards);
+  bool Overflow;
+  ConstantRange UR = SE.getUnsignedRange(Offset);
+  if (!UR.isEmptySet() && !UR.isFullSet() && !UR.isWrappedSet() &&
+      UR.getUnsignedMax().isNonNegative()) {
+    APInt Hi = UR.getUnsignedMax().sadd_ov(EltSize, Overflow);
+    if (!Overflow)
+      return std::make_pair(UR.getUnsignedMin(), Hi);
+  }
+  if (!AllowSigned)
+    return std::nullopt;
+  ConstantRange SR = SE.getSignedRange(Offset);
+  if (SR.isEmptySet() || SR.isFullSet() || SR.isSignWrappedSet())
+    return std::nullopt;
+  APInt Hi = SR.getSignedMax().sadd_ov(EltSize, Overflow);
+  if (Overflow)
+    return std::nullopt;
+  return std::make_pair(SR.getSignedMin(), Hi);
+}
+
+/// Return true if \p Obj is an object whose size, as computed by
+/// ObjectSizeOffsetVisitor, is the whole extent of the memory it designates: an
+/// alloca, a global variable, a noalias allocation call or a byval argument.
+/// Other pointers can point into a larger allocation. For example, a call with
+/// allocsize only returns at least that many bytes, byref and sret arguments
+/// can point into a larger caller allocation, and noalias on an argument does
+/// not bound its extent.
+static bool isSizedIdentifiedObject(const Value *Obj) {
+  if (const auto *A = dyn_cast<Argument>(Obj))
+    return A->hasByValAttr();
+  return isIdentifiedObject(Obj);
+}
+
+/// Try to bound a loop-variant pointer that is not an affine AddRec by the
+/// allocation its loop-invariant base points into: a global variable, an
+/// alloca, a noalias allocation call whose size is known or a byval argument.
+///
+/// Every executed access is based on that allocation, so it accesses bytes
+/// inside it. An allocation does not cross the end of the address space and
+/// its size fits in the signed index type (see LangRef, Allocated Objects), so
+/// the interval does not wrap, and an offset in the signed range of the index
+/// type is the exact distance from the base. The interval is intersected with
+/// the value range of the offset.
+///
+/// This only holds if the size is the whole extent of the object. Every
+/// underlying object of the base must therefore satisfy
+/// isSizedIdentifiedObject, as BasicAA requires in isObjectSmallerThan.
+static std::pair<const SCEV *, const SCEV *>
+getNonAffineObjectBounds(const Loop *Lp, const SCEV *PtrExpr,
+                         const SCEV *EltSizeSCEV, ScalarEvolution *SE,
+                         ScalarEvolution::LoopGuards *Guards) {
+  const auto *Base = dyn_cast<SCEVUnknown>(SE->getPointerBase(PtrExpr));
+  const auto *EltSizeC = dyn_cast<SCEVConstant>(EltSizeSCEV);
+  if (!Base || !SE->isLoopInvariant(Base, Lp) || !EltSizeC)
+    return {nullptr, nullptr};
+  const SCEV *Offset = SE->removePointerBase(PtrExpr);
+  if (isa<SCEVCouldNotCompute>(Offset) ||
+      Offset->getType() != EltSizeSCEV->getType())
+    return {nullptr, nullptr};
+
+  SmallVector<const Value *, 4> Objects;
+  getUnderlyingObjects(Base->getValue(), Objects);
+  if (!all_of(Objects, isSizedIdentifiedObject))
+    return {nullptr, nullptr};
+
+  const DataLayout &DL = Lp->getHeader()->getDataLayout();
+  ObjectSizeOpts Opts;
+  Opts.EvalMode = ObjectSizeOpts::Mode::ExactUnderlyingSizeAndOffset;
+  ObjectSizeOffsetVisitor Visitor(DL, /*TLI=*/nullptr,
+                                  Base->getType()->getContext(), Opts);
+  SizeOffsetAPInt SizeOffset = Visitor.compute(Base->getValue());
+  unsigned BitWidth = EltSizeC->getAPInt().getBitWidth();
+  if (!SizeOffset.bothKnown() || SizeOffset.Size.getBitWidth() != BitWidth ||
+      SizeOffset.Offset.isNegative() || SizeOffset.Offset.ugt(SizeOffset.Size))
+    return {nullptr, nullptr};
+
+  // [Allocation start, allocation end) relative to Base.
+  APInt Lo = -SizeOffset.Offset;
+  APInt Hi = SizeOffset.Size - SizeOffset.Offset;
+  if (auto Range = getOffsetRangeInterval(Offset, EltSizeC->getAPInt(), *SE,
+                                          Guards, /*AllowSigned=*/true)) {
+    Lo = APIntOps::smax(Lo, Range->first);
+    Hi = APIntOps::smin(Hi, Range->second);
+  }
+  if (Lo.sge(Hi))
+    return {nullptr, nullptr};
+  return {SE->getAddExpr(Base, SE->getConstant(Lo)),
+          SE->getAddExpr(Base, SE->getConstant(Hi))};
+}
+
+/// Return \p Base + \p Off, saturating at the ends of the address space instead
+/// of wrapping: Base + umin(Off, ~Base) for a non-negative \p Off, and
+/// Base - umin(-Off, Base) for a negative one.
+static const SCEV *getSaturatingPtrAdd(const SCEV *Base, const APInt &Off,
+                                       ScalarEvolution &SE) {
+  if (Off.isZero())
+    return Base;
+  const SCEV *BaseInt = SE.getPtrToAddrExpr(Base);
+  if (isa<SCEVCouldNotCompute>(BaseInt) ||
+      SE.getTypeSizeInBits(BaseInt->getType()) != Off.getBitWidth())
+    return nullptr;
+  if (Off.isNonNegative())
+    return SE.getAddExpr(
+        Base, SE.getUMinExpr(SE.getConstant(Off), SE.getNotSCEV(BaseInt)));
+  return SE.getAddExpr(
+      Base, SE.getNegativeSCEV(SE.getUMinExpr(SE.getConstant(-Off), BaseInt)));
+}
+
+/// Return the interval [Base + Lo, Base + Hi) of an access, saturating the ends
+/// that may wrap. A non-negative \p Lo cannot wrap, because Base + Lo is at
+/// most the address of an executed access.
+static std::pair<const SCEV *, const SCEV *>
+getSaturatingInterval(const SCEV *Base, const APInt &Lo, const APInt &Hi,
+                      ScalarEvolution &SE) {
+  const SCEV *Start;
+  if (Lo.isNonNegative())
+    Start = SE.getAddExpr(Base, SE.getConstant(Lo));
+  else
+    Start = getSaturatingPtrAdd(Base, Lo, SE);
+  const SCEV *End = getSaturatingPtrAdd(Base, Hi, SE);
+  if (!Start || !End)
+    return {nullptr, nullptr};
+  return {Start, End};
+}
+
+/// Try to bound a loop-variant pointer that is not an affine AddRec by the
+/// unsigned value range of its offset from a loop-invariant base. Non-constant
+/// loop-invariant terms of the offset are moved into the base first, so only
+/// the loop-variant part needs a small range.
+///
+/// The pointer must be a non-wrapping add, so the address of every executed
+/// access is at least the start of the interval. The interval also covers
+/// offsets that no access uses, so its end saturates instead of wrapping, and
+/// its size is limited by MaxRangeBoundBytes.
+static std::pair<const SCEV *, const SCEV *>
+getNonAffineRangeBounds(const Loop *Lp, const SCEV *PtrExpr,
+                        const SCEV *EltSizeSCEV, ScalarEvolution *SE,
+                        ScalarEvolution::LoopGuards *Guards) {
+  const auto *PtrAdd = dyn_cast<SCEVAddExpr>(PtrExpr);
+  const auto *EltSizeC = dyn_cast<SCEVConstant>(EltSizeSCEV);
+  if (!PtrAdd || !PtrAdd->hasNoUnsignedWrap() || !EltSizeC)
+    return {nullptr, nullptr};
+  // The base is the pointer operand of the add, not the base of a nested
+  // pointer: the no-wrap flag of the add only covers its own operands.
+  const auto *PtrOp = find_if(PtrAdd->operands(), [](const SCEV *Op) {
+    return Op->getType()->isPointerTy();
+  });
+  if (PtrOp == PtrAdd->operands().end() || !SE->isLoopInvariant(*PtrOp, Lp))
+    return {nullptr, nullptr};
+  const SCEV *Base = *PtrOp;
+  const SCEV *Offset = SE->getMinusSCEV(PtrExpr, Base);
+  if (isa<SCEVCouldNotCompute>(Offset) ||
+      Offset->getType() != EltSizeSCEV->getType())
+    return {nullptr, nullptr};
+
+  auto [Invariant, Variant] = splitLoopInvariantOffset(Offset, Lp, *SE);
+  if (Invariant)
+    Base = SE->getAddExpr(Base, Invariant);
+
+  auto Interval =
+      getOffsetRangeInterval(Variant, EltSizeC->getAPInt(), *SE, Guards);
+  if (!Interval || (Interval->second - Interval->first).ugt(MaxRangeBoundBytes))
+    return {nullptr, nullptr};
+  return getSaturatingInterval(Base, Interval->first, Interval->second, *SE);
+}
+
+/// Try to bound the loop-variant pointer \p Ptr, with SCEV \p PtrExpr, by the
+/// value range of its offset from the first loop-invariant pointer in the chain
+/// of GEPs that computes it. Unlike the SCEV no-wrap flags, the flags of the
+/// GEPs only hold where \p Ptr is accessed, so the result is only valid for
+/// accesses through \p Ptr.
+///
+/// If every GEP in the chain is nuw, the address of an executed access is the
+/// root plus the unsigned value of the offset. If every GEP is inbounds, the
+/// root and the address of an executed access are in bounds of the same
+/// allocation (LangRef, getelementptr), whose size fits in the signed index
+/// type, so the address is the root plus the signed value of the offset.
+static std::pair<const SCEV *, const SCEV *>
+getNonAffineGEPBounds(const Loop *Lp, const SCEV *PtrExpr, Value *Ptr,
+                      const SCEV *EltSizeSCEV, ScalarEvolution *SE,
+                      ScalarEvolution::LoopGuards *Guards) {
+  const auto *EltSizeC = dyn_cast<SCEVConstant>(EltSizeSCEV);
+  if (!Ptr || !EltSizeC)
+    return {nullptr, nullptr};
+  bool AllNUW = true, AllInBounds = true;
+  const SCEV *Root = nullptr;
+  for (auto *GEP = dyn_cast<GEPOperator>(Ptr); GEP;
+       GEP = dyn_cast<GEPOperator>(GEP->getPointerOperand())) {
+    AllNUW &= GEP->hasNoUnsignedWrap();
+    AllInBounds &= GEP->isInBounds();
+    if ((!AllNUW && !AllInBounds) || GEP->getType()->isVectorTy())
+      return {nullptr, nullptr};
+    const SCEV *Op = SE->getSCEV(GEP->getPointerOperand());
+    if (SE->isLoopInvariant(Op, Lp)) {
+      Root = Op;
+      break;
+    }
+  }
+  if (!Root)
+    return {nullptr, nullptr};
+  const SCEV *Offset = SE->getMinusSCEV(PtrExpr, Root);
+  if (isa<SCEVCouldNotCompute>(Offset) ||
+      Offset->getType() != EltSizeSCEV->getType())
+    return {nullptr, nullptr};
+
+  const APInt &EltSize = EltSizeC->getAPInt();
+  std::optional<std::pair<APInt, APInt>> Interval;
+  if (AllNUW)
+    Interval = getOffsetRangeInterval(Offset, EltSize, *SE, Guards);
+  if (!Interval && AllInBounds)
+    Interval = getOffsetRangeInterval(Offset, EltSize, *SE, Guards,
+                                      /*AllowSigned=*/true);
+  if (!Interval || (Interval->second - Interval->first).ugt(MaxRangeBoundBytes))
+    return {nullptr, nullptr};
+  return getSaturatingInterval(Root, Interval->first, Interval->second, *SE);
+}
+
+/// Try to bound a loop-variant pointer that is not an affine AddRec, as a
+/// monotonic expression, by the allocation its base points into, or by the
+/// value range of its offset. The result only depends on \p PtrExpr, so it can
+/// be cached by it.
+static std::pair<const SCEV *, const SCEV *>
+getNonAffineBounds(const Loop *Lp, const SCEV *PtrExpr, const SCEV *EltSizeSCEV,
+                   ScalarEvolution *SE, ScalarEvolution::LoopGuards *Guards) {
+  auto Bounds = getNonAffineMonotonicBounds(Lp, PtrExpr, EltSizeSCEV, SE);
+  if (!Bounds.first)
+    Bounds = getNonAffineObjectBounds(Lp, PtrExpr, EltSizeSCEV, SE, Guards);
+  if (!Bounds.first)
+    Bounds = getNonAffineRangeBounds(Lp, PtrExpr, EltSizeSCEV, SE, Guards);
+  return Bounds;
+}
+
 std::pair<const SCEV *, const SCEV *> llvm::getStartAndEndForAccess(
     const Loop *Lp, const SCEV *PtrExpr, Type *AccessTy, const SCEV *BTC,
     const SCEV *MaxBTC, ScalarEvolution *SE,
     DenseMap<std::pair<const SCEV *, const SCEV *>,
              std::pair<const SCEV *, const SCEV *>> *PointerBounds,
     DominatorTree *DT, AssumptionCache *AC,
-    ScalarEvolution::LoopGuards &LoopGuards) {
+    ScalarEvolution::LoopGuards &LoopGuards, Value *Ptr) {
   auto &DL = Lp->getHeader()->getDataLayout();
   Type *IdxTy = DL.getIndexType(PtrExpr->getType());
   const SCEV *EltSizeSCEV = SE->getStoreSizeOfExpr(IdxTy, AccessTy);
 
   // Delegate to the SCEV-based overload, passing through the cache.
   return getStartAndEndForAccess(Lp, PtrExpr, EltSizeSCEV, BTC, MaxBTC, SE,
-                                 PointerBounds, DT, AC, LoopGuards);
+                                 PointerBounds, DT, AC, LoopGuards, Ptr);
 }
 
-std::pair<const SCEV *, const SCEV *> llvm::getStartAndEndForAccess(
+/// Compute the bounds of an access from \p PtrExpr alone, caching the result,
+/// including a failure, in \p PointerBounds.
+static std::pair<const SCEV *, const SCEV *> getStartAndEndForAccessBySCEV(
     const Loop *Lp, const SCEV *PtrExpr, const SCEV *EltSizeSCEV,
     const SCEV *BTC, const SCEV *MaxBTC, ScalarEvolution *SE,
     DenseMap<std::pair<const SCEV *, const SCEV *>,
@@ -521,10 +809,10 @@ std::pair<const SCEV *, const SCEV *> llvm::getStartAndEndForAccess(
       ScEnd = SE->getAddExpr(SE->getUMaxExpr(Start, LastAddr), EltSizeSCEV);
     }
   } else {
-    // The pointer is loop-variant but not an affine AddRec. Try to form a
-    // tight bound for a monotonic offset (see getNonAffineMonotonicBounds).
+    // The pointer is loop-variant but not an affine AddRec (see
+    // getNonAffineBounds). The placeholder in the cache records a failure.
     std::tie(ScStart, ScEnd) =
-        getNonAffineMonotonicBounds(Lp, PtrExpr, EltSizeSCEV, SE);
+        getNonAffineBounds(Lp, PtrExpr, EltSizeSCEV, SE, &LoopGuards);
     if (!ScStart)
       return {SE->getCouldNotCompute(), SE->getCouldNotCompute()};
   }
@@ -538,6 +826,29 @@ std::pair<const SCEV *, const SCEV *> llvm::getStartAndEndForAccess(
   return Res;
 }
 
+std::pair<const SCEV *, const SCEV *> llvm::getStartAndEndForAccess(
+    const Loop *Lp, const SCEV *PtrExpr, const SCEV *EltSizeSCEV,
+    const SCEV *BTC, const SCEV *MaxBTC, ScalarEvolution *SE,
+    DenseMap<std::pair<const SCEV *, const SCEV *>,
+             std::pair<const SCEV *, const SCEV *>> *PointerBounds,
+    DominatorTree *DT, AssumptionCache *AC,
+    ScalarEvolution::LoopGuards &LoopGuards, Value *Ptr) {
+  auto Res =
+      getStartAndEndForAccessBySCEV(Lp, PtrExpr, EltSizeSCEV, BTC, MaxBTC, SE,
+                                    PointerBounds, DT, AC, LoopGuards);
+  // The flags of the GEPs computing Ptr only hold where Ptr is accessed, so a
+  // bound taken from them does not apply to another access with the same SCEV.
+  // Do not cache it.
+  if (Ptr && isa<SCEVCouldNotCompute>(Res.first) &&
+      !SE->isLoopInvariant(PtrExpr, Lp) && !isa<SCEVAddRecExpr>(PtrExpr)) {
+    auto Bounds =
+        getNonAffineGEPBounds(Lp, PtrExpr, Ptr, EltSizeSCEV, SE, &LoopGuards);
+    if (Bounds.first)
+      return Bounds;
+  }
+  return Res;
+}
+
 /// Calculate Start and End points of memory access using
 /// getStartAndEndForAccess.
 bool RuntimePointerChecking::insert(Loop *Lp, Value *Ptr, const SCEV *PtrExpr,
@@ -547,9 +858,10 @@ bool RuntimePointerChecking::insert(Loop *Lp, Value *Ptr, const SCEV *PtrExpr,
                                     bool NeedsFreeze, bool IsForked) {
   const SCEV *SymbolicMaxBTC = PSE.getSymbolicMaxBackedgeTakenCount();
   const SCEV *BTC = PSE.getBackedgeTakenCount();
-  const auto &[ScStart, ScEnd] = getStartAndEndForAccess(
-      Lp, PtrExpr, AccessTy, BTC, SymbolicMaxBTC, PSE.getSE(),
-      &DC.getPointerBounds(), DC.getDT(), DC.getAC(), LoopGuards);
+  const auto &[ScStart, ScEnd] =
+      getStartAndEndForAccess(Lp, PtrExpr, AccessTy, BTC, SymbolicMaxBTC,
+                              PSE.getSE(), &DC.getPointerBounds(), DC.getDT(),
+                              DC.getAC(), LoopGuards, IsForked ? nullptr : Ptr);
   if (isa<SCEVCouldNotCompute>(ScStart) || isa<SCEVCouldNotCompute>(ScEnd))
     return false;
   Pointers.emplace_back(Ptr, ScStart, ScEnd, WritePtr, DepSetId, ASId, PtrExpr,
@@ -1804,7 +2116,7 @@ private:
   SmallVector<MemAccessInfo, 8> CheckDeps;
 
   /// Set of pointers that are read only.
-  SmallPtrSet<Value*, 16> ReadOnlyPtr;
+  SmallPtrSet<Value *, 16> ReadOnlyPtr;
 
   /// Capture analysis for BAA.
   EarliestEscapeAnalysis EEA;
@@ -1813,7 +2125,7 @@ private:
   BatchAAResults BAA;
 
   /// An alias set tracker to partition the access set by underlying object and
-  //intrinsic property (such as TBAA metadata).
+  // intrinsic property (such as TBAA metadata).
   AliasSetTracker AST;
 
   /// The LoopInfo of the loop being checked.
@@ -2166,12 +2478,19 @@ bool AccessAnalysis::createCheckForAccess(RuntimePointerChecking &RtCheck,
 
   // RTCheckPtrs must have size 2 if there are forked pointers. Otherwise, there
   // are no forked pointers; replaceSymbolicStridesSCEV in this case.
-  auto IsLoopInvariantOrAR =
-      [&SE, &TheLoop](const PointerIntPair<const SCEV *, 1, bool> &P) {
-        return SE->isLoopInvariant(P.getPointer(), TheLoop) ||
-               isa<SCEVAddRecExpr>(P.getPointer());
-      };
-  if (RTCheckPtrs.size() == 2 && all_of(RTCheckPtrs, IsLoopInvariantOrAR)) {
+  auto GetEltSize = [&](const SCEV *PtrExpr) {
+    return SE->getStoreSizeOfExpr(DL.getIndexType(PtrExpr->getType()),
+                                  AccessTy);
+  };
+  auto CanCheckFork = [&](const PointerIntPair<const SCEV *, 1, bool> &P) {
+    const SCEV *PtrExpr = P.getPointer();
+    return SE->isLoopInvariant(PtrExpr, TheLoop) ||
+           isa<SCEVAddRecExpr>(PtrExpr) ||
+           (Assume && getNonAffineBounds(TheLoop, PtrExpr, GetEltSize(PtrExpr),
+                                         SE, &RtCheck.getLoopGuards())
+                          .first);
+  };
+  if (RTCheckPtrs.size() == 2 && all_of(RTCheckPtrs, CanCheckFork)) {
     LLVM_DEBUG(dbgs() << "LAA: Found forked pointer: " << *Ptr << "\n";
                for (const auto &[Idx, Q] : enumerate(RTCheckPtrs)) dbgs()
                << "\t(" << Idx << ") " << *Q.getPointer() << "\n");
@@ -2192,12 +2511,17 @@ bool AccessAnalysis::createCheckForAccess(RuntimePointerChecking &RtCheck,
     if (!AR && Assume)
       AR = PSE.getAsAddRec(Ptr, &Predicates);
     if (!AR || !AR->isAffine()) {
-      // Check if bounds for non-affine monotonic expressions can be formed.
-      const SCEV *EltSizeSCEV = SE->getStoreSizeOfExpr(
-          DL.getIndexType(P.getPointer()->getType()), AccessTy);
-      if (!Assume ||
-          !getNonAffineMonotonicBounds(TheLoop, P.getPointer(), EltSizeSCEV, SE)
-               .first)
+      // Check if bounds for non-affine expressions can be formed.
+      if (!Assume)
+        return false;
+      const SCEV *EltSize = GetEltSize(P.getPointer());
+      ScalarEvolution::LoopGuards *Guards = &RtCheck.getLoopGuards();
+      auto Bounds =
+          getNonAffineBounds(TheLoop, P.getPointer(), EltSize, SE, Guards);
+      if (!Bounds.first && RTCheckPtrs.size() == 1)
+        Bounds = getNonAffineGEPBounds(TheLoop, P.getPointer(), Ptr, EltSize,
+                                       SE, Guards);
+      if (!Bounds.first)
         return false;
       continue;
     }
@@ -2262,7 +2586,8 @@ bool AccessAnalysis::canCheckPtrAtRT(RuntimePointerChecking &RtCheck,
   bool CanDoRT = true;
 
   bool MayNeedRTCheck = false;
-  if (!IsRTCheckAnalysisNeeded) return true;
+  if (!IsRTCheckAnalysisNeeded)
+    return true;
 
   if (auto *Deps = DepChecker.getDependences()) {
     // If there are unknown dependences, this means runtime checks are needed to
@@ -2416,7 +2741,7 @@ bool AccessAnalysis::canCheckPtrAtRT(RuntimePointerChecking &RtCheck,
       // Only need to check pointers between two different dependency sets.
       if (RtCheck.Pointers[i].DependencySetId ==
           RtCheck.Pointers[j].DependencySetId)
-       continue;
+        continue;
       // Only need to check pointers in the same alias set.
       if (RtCheck.Pointers[i].AliasSetId != RtCheck.Pointers[j].AliasSetId)
         continue;
@@ -2973,22 +3298,21 @@ static bool areStridedAccessesIndependent(uint64_t Distance, uint64_t Stride,
   return Distance % Stride;
 }
 
-bool MemoryDepChecker::areAccessesCompletelyBeforeOrAfter(const SCEV *Src,
-                                                          Type *SrcTy,
-                                                          const SCEV *Sink,
-                                                          Type *SinkTy) {
+bool MemoryDepChecker::areAccessesCompletelyBeforeOrAfter(
+    const SCEV *Src, Type *SrcTy, const SCEV *Sink, Type *SinkTy, Value *SrcPtr,
+    Value *SinkPtr) {
   const SCEV *BTC = PSE.getBackedgeTakenCount();
   const SCEV *SymbolicMaxBTC = PSE.getSymbolicMaxBackedgeTakenCount();
   ScalarEvolution &SE = *PSE.getSE();
   const auto &[SrcStart_, SrcEnd_] =
       getStartAndEndForAccess(InnermostLoop, Src, SrcTy, BTC, SymbolicMaxBTC,
-                              &SE, &PointerBounds, DT, AC, LoopGuards);
+                              &SE, &PointerBounds, DT, AC, LoopGuards, SrcPtr);
   if (isa<SCEVCouldNotCompute>(SrcStart_) || isa<SCEVCouldNotCompute>(SrcEnd_))
     return false;
 
   const auto &[SinkStart_, SinkEnd_] =
       getStartAndEndForAccess(InnermostLoop, Sink, SinkTy, BTC, SymbolicMaxBTC,
-                              &SE, &PointerBounds, DT, AC, LoopGuards);
+                              &SE, &PointerBounds, DT, AC, LoopGuards, SinkPtr);
   if (isa<SCEVCouldNotCompute>(SinkStart_) ||
       isa<SCEVCouldNotCompute>(SinkEnd_))
     return false;
@@ -3137,7 +3461,7 @@ MemoryDepChecker::isDependent(const MemAccessInfo &A, unsigned AIdx,
     Type *BTy = getLoadStoreType(InstMap[BIdx]);
     const SCEV *Src = PSE.getSCEV(APtr);
     const SCEV *Sink = PSE.getSCEV(BPtr);
-    return areAccessesCompletelyBeforeOrAfter(Src, ATy, Sink, BTy);
+    return areAccessesCompletelyBeforeOrAfter(Src, ATy, Sink, BTy, APtr, BPtr);
   };
 
   // Get the dependence distance, stride, type size and what access writes for
@@ -3265,8 +3589,9 @@ MemoryDepChecker::isDependent(const MemAccessInfo &A, unsigned AIdx,
   // Bail out early if passed-in parameters make vectorization not feasible.
   unsigned MinForcedFactor =
       std::max(1U, VectorizerParams::VectorizationFactor.getKnownMinValue());
-  unsigned ForcedUnroll = (VectorizerParams::VectorizationInterleave ?
-                           VectorizerParams::VectorizationInterleave : 1);
+  unsigned ForcedUnroll = (VectorizerParams::VectorizationInterleave
+                               ? VectorizerParams::VectorizationInterleave
+                               : 1);
   // The minimum number of iterations for a vectorized/unrolled version.
   unsigned MinNumIter = std::max(MinForcedFactor * ForcedUnroll, 2U);
 
@@ -3721,8 +4046,8 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
       IsReadOnlyPtr = true;
     }
 
-    // See if there is an unsafe dependency between a load to a uniform address and
-    // store to the same uniform address.
+    // See if there is an unsafe dependency between a load to a uniform address
+    // and store to the same uniform address.
     if (UniformStores.contains(Ptr)) {
       LLVM_DEBUG(dbgs() << "LAA: Found an unsafe dependency between a uniform "
                            "load and uniform store to the same address!\n");
@@ -3773,7 +4098,8 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
   }
 
   LLVM_DEBUG(
-    dbgs() << "LAA: May be able to perform a memory runtime check if needed.\n");
+      dbgs()
+      << "LAA: May be able to perform a memory runtime check if needed.\n");
 
   bool DepsAreSafe = true;
   if (Accesses.isDependencyCheckNeeded()) {
@@ -3977,7 +4303,8 @@ static Value *getLoopVariantGEPOperand(Value *Ptr, ScalarEvolution *SE,
 
 /// Get the stride of a pointer access in a loop. Looks for symbolic
 /// strides "a[i*stride]". Returns the symbolic stride, or null otherwise.
-static const SCEV *getStrideFromPointer(Value *Ptr, ScalarEvolution *SE, Loop *Lp) {
+static const SCEV *getStrideFromPointer(Value *Ptr, ScalarEvolution *SE,
+                                        Loop *Lp) {
   auto *PtrTy = dyn_cast<PointerType>(Ptr->getType());
   if (!PtrTy)
     return nullptr;
@@ -4071,7 +4398,8 @@ void LoopAccessInfo::collectStridedAccess(Value *MemAccess) {
     CastedStride = SE->getNoopOrSignExtend(StrideExpr, MaxBTC->getType());
   else
     CastedBECount = SE->getZeroExtendExpr(MaxBTC, StrideExpr->getType());
-  const SCEV *StrideMinusBETaken = SE->getMinusSCEV(CastedStride, CastedBECount);
+  const SCEV *StrideMinusBETaken =
+      SE->getMinusSCEV(CastedStride, CastedBECount);
   // Since TripCount == BackEdgeTakenCount + 1, checking:
   // "Stride >= TripCount" is equivalent to checking:
   // Stride - MaxBTC> 0
@@ -4188,8 +4516,8 @@ const LoopAccessInfo &LoopAccessInfoManager::getInfo(Loop &L,
 void LoopAccessInfoManager::clear() {
   // Collect LoopAccessInfo entries that may keep references to IR outside the
   // analyzed loop or SCEVs that may have been modified or invalidated. At the
-  // moment, that is loops requiring memory or SCEV runtime checks, as those cache
-  // SCEVs, e.g. for pointer expressions.
+  // moment, that is loops requiring memory or SCEV runtime checks, as those
+  // cache SCEVs, e.g. for pointer expressions.
   LoopAccessInfoMap.remove_if([](const auto &Entry) {
     const auto &LAI = Entry.second;
     return !(LAI->getRuntimePointerChecking()->getChecks().empty() &&

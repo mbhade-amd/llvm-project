@@ -489,9 +489,11 @@ private:
                                      Instruction *BInst);
 
   // Return true if we can prove that \p Sink only accesses memory after \p
-  // Src's end or vice versa.
+  // Src's end or vice versa. \p SrcPtr and \p SinkPtr are the IR pointers of
+  // the accesses, so a bound that depends on GEP flags can be used.
   bool areAccessesCompletelyBeforeOrAfter(const SCEV *Src, Type *SrcTy,
-                                          const SCEV *Sink, Type *SinkTy);
+                                          const SCEV *Sink, Type *SinkTy,
+                                          Value *SrcPtr, Value *SinkPtr);
 };
 
 class RuntimePointerChecking;
@@ -610,6 +612,9 @@ public:
   /// Generate the checks and store it.  This also performs the grouping
   /// of pointers to reduce the number of memchecks necessary.
   LLVM_ABI void generateChecks(MemoryDepChecker::DepCandidates &DepCands);
+
+  /// The loop guards of the loop being checked, collected on first use.
+  ScalarEvolution::LoopGuards &getLoopGuards() const { return LoopGuards; }
 
   /// Returns the checks that generateChecks created. They can be used to ensure
   /// no read/write accesses overlap across all loop iterations.
@@ -997,20 +1002,23 @@ LLVM_ABI bool isConsecutiveAccess(Value *A, Value *B, const DataLayout &DL,
 ///
 /// There is no conflict when the intervals are disjoint:
 /// NoConflict = (P2.Start >= P1.End) || (P1.Start >= P2.End)
+///
+/// If \p Ptr is the IR pointer of the access, the flags of the GEPs computing
+/// it may also be used to bound a pointer that is not an affine AddRec.
 LLVM_ABI std::pair<const SCEV *, const SCEV *> getStartAndEndForAccess(
     const Loop *Lp, const SCEV *PtrExpr, Type *AccessTy, const SCEV *BTC,
     const SCEV *MaxBTC, ScalarEvolution *SE,
     DenseMap<std::pair<const SCEV *, const SCEV *>,
              std::pair<const SCEV *, const SCEV *>> *PointerBounds,
     DominatorTree *DT, AssumptionCache *AC,
-    ScalarEvolution::LoopGuards &LoopGuards);
+    ScalarEvolution::LoopGuards &LoopGuards, Value *Ptr = nullptr);
 LLVM_ABI std::pair<const SCEV *, const SCEV *> getStartAndEndForAccess(
     const Loop *Lp, const SCEV *PtrExpr, const SCEV *EltSizeSCEV,
     const SCEV *BTC, const SCEV *MaxBTC, ScalarEvolution *SE,
     DenseMap<std::pair<const SCEV *, const SCEV *>,
              std::pair<const SCEV *, const SCEV *>> *PointerBounds,
     DominatorTree *DT, AssumptionCache *AC,
-    ScalarEvolution::LoopGuards &LoopGuards);
+    ScalarEvolution::LoopGuards &LoopGuards, Value *Ptr = nullptr);
 
 class LoopAccessInfoManager {
   /// The cache.
